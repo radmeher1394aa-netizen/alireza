@@ -44,7 +44,7 @@ install_prereqs(){
   wait_apt
   say "Installing prerequisites"
   apt-get update -y
-  apt-get install -y curl ca-certificates tar gzip unzip psmisc iproute2 procps
+  apt-get install -y curl ca-certificates tar gzip unzip psmisc iproute2 procps python3
   ok "Prerequisites ready"
 }
 
@@ -168,47 +168,41 @@ install_adguard(){
 }
 
 configure_adguard_dns(){
-  # AdGuard's first-run wizard owns initial admin credentials and upstream choice.
-  # Once its YAML exists, make sure DNS listens on all interfaces:53 without
-  # overwriting filters, users, upstreams, or other AdGuard settings.
   local y="$ADG_DIR/AdGuardHome.yaml"
-  [ -f "$y" ] || {
-    warn "AdGuard first-run configuration is not created yet."
-    warn "Open its setup page, finish the wizard, select 0.0.0.0 and port 53 for DNS."
-    return 0
-  }
-
+  say "Configuring AdGuard Home automatically"
   systemctl stop AdGuardHome 2>/dev/null || "$ADG_BIN" -s stop 2>/dev/null || true
-
+  if [ ! -s "$y" ]; then timeout 5 "$ADG_BIN" --no-check-update -w "$ADG_DIR" -c "$y" >/dev/null 2>&1 || true; fi
+  [ -s "$y" ] || die "Could not create AdGuardHome.yaml"
   cp -a "$y" "$y.before-alireza.$(date +%Y%m%d%H%M%S)"
   python3 - "$y" <<'PY'
-import re, sys
-p=sys.argv[1]
-s=open(p,encoding="utf-8").read()
-# Only modify the dns: block and preserve everything else.
-m=re.search(r'(?ms)^dns:\n(?P<body>(?:^[ \t]+.*\n?)*)',s)
-if not m:
-    raise SystemExit(0)
-body=m.group("body")
-if re.search(r'(?m)^[ \t]+bind_hosts:\s*$',body):
-    # Replace bind_hosts list with all IPv4 interfaces.
-    body=re.sub(r'(?ms)^([ \t]+)bind_hosts:\s*\n(?:\1[ \t]+-.*\n)*',
-                r'\1bind_hosts:\n\1  - 0.0.0.0\n',body,count=1)
-elif re.search(r'(?m)^[ \t]+bind_host:',body):
-    body=re.sub(r'(?m)^([ \t]+)bind_host:.*$',r'\1bind_host: 0.0.0.0',body,count=1)
-if re.search(r'(?m)^[ \t]+port:',body):
-    body=re.sub(r'(?m)^([ \t]+)port:\s*\d+\s*$',r'\1port: 53',body,count=1)
-s=s[:m.start("body")]+body+s[m.end("body"):]
-open(p,"w",encoding="utf-8").write(s)
+import re,sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+if re.search(r'(?m)^http:\s*$',s):
+ m=re.search(r'(?ms)^http:\s*\n(?P<b>(?:^[ \t]+.*\n?)*)',s); x=m.group('b')
+ if re.search(r'(?m)^[ \t]+address:',x): x=re.sub(r'(?m)^([ \t]+)address:.*$',r'\1address: 127.0.0.1:3000',x,count=1)
+ else: x='  address: 127.0.0.1:3000\n'+x
+ s=s[:m.start('b')]+x+s[m.end('b'):]
+else:
+ s=re.sub(r'(?m)^bind_host:.*$','bind_host: 127.0.0.1',s,count=1)
+ s=re.sub(r'(?m)^bind_port:\s*\d+.*$','bind_port: 3000',s,count=1)
+s=re.sub(r'(?ms)^users:\s*\n(?:^[ \t]+.*\n?)*?(?=^[A-Za-z_])','users: []\n',s,count=1)
+if not re.search(r'(?m)^users:',s): s+='\nusers: []\n'
+m=re.search(r'(?ms)^dns:\s*\n(?P<b>(?:^[ \t]+.*\n?)*)',s)
+if not m: raise SystemExit("dns section missing")
+x=m.group('b')
+if re.search(r'(?m)^[ \t]+bind_hosts:\s*$',x): x=re.sub(r'(?ms)^([ \t]+)bind_hosts:\s*\n(?:\1[ \t]+-.*\n)*',r'\1bind_hosts:\n\1  - 0.0.0.0\n',x,count=1)
+elif re.search(r'(?m)^[ \t]+bind_host:',x): x=re.sub(r'(?m)^([ \t]+)bind_host:.*$',r'\1bind_host: 0.0.0.0',x,count=1)
+else: x='  bind_hosts:\n    - 0.0.0.0\n'+x
+if re.search(r'(?m)^[ \t]+port:',x): x=re.sub(r'(?m)^([ \t]+)port:\s*\d+.*$',r'\1port: 53',x,count=1)
+else: x='  port: 53\n'+x
+s=s[:m.start('b')]+x+s[m.end('b'):]
+open(p,'w',encoding='utf-8').write(s)
 PY
-
   systemctl start AdGuardHome 2>/dev/null || "$ADG_BIN" -s start
   sleep 2
-  if ss -lnup 2>/dev/null | grep -E ':53[[:space:]]' | grep -qi AdGuard; then
-    ok "AdGuard DNS is listening on UDP :53"
-  else
-    warn "AdGuard is installed, but UDP :53 is not active yet. Complete/check its setup."
-  fi
+  systemctl is-active --quiet AdGuardHome || die "AdGuard Home failed to start"
+  ss -lnup 2>/dev/null | grep -E ':53[[:space:]]' | grep -qi AdGuard || die "AdGuard is not listening on UDP :53"
+  ok "AdGuard ready: DNS :53; native UI localhost :3000; no separate account"
 }
 
 lowmem_limits(){
